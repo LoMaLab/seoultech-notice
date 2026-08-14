@@ -68,20 +68,53 @@ def send_alert(new_items):
     count = len(new_items)
     subject = f"[과기대 공지] [{new_items[0]['board']}] {new_items[0]['title']}" if count == 1 else f"[과기대 공지] 신규 공지사항 {count}건이 등록되었습니다."
 
+    # 1. 텍스트 전용 본문 (메일 앱에서 HTML을 못 불러올 때 대비)
+    plain_text = "🔔 서울과기대 신규 공지사항 알림\n\n"
+    for item in new_items:
+        plain_text += f"■ [{item['board']}] {item['date']}\n"
+        plain_text += f"제목: {item['title']}\n"
+        plain_text += f"링크: {item['link']}\n\n"
+
+    # 2. 네이버 메일 앱 필터링을 완벽하게 우회하는 HTML 서식
     html_items = ""
     for item in new_items:
         html_items += f"""
         
-            [{item['board']}] {item['date']}
-            {item['title']}
-            공지 바로가기 →
+            
+                📌 [{item['board']}]  |  📅 {item['date']}
+            
+            
+                
+                    {item['title']}
+                
+            
+            
+            
+                
+                    👉 [ 🔗 공지 본문 바로가기 (터치) ]
+                
+            
+            
+                바로가기 주소: {item['link']}
+            
         
         """
 
-    html = f"""
+    html_content = f"""
     
-        🔔 서울과기대 실시간 공지 알림
-        {html_items}
+    
+    
+    
+        
+            
+                🔔 서울과기대 신규 공지사항
+            
+            {html_items}
+            
+                서울과학기술대학교 24시간 실시간 공지 알림 시스템
+            
+        
+    
     
     """
 
@@ -89,7 +122,10 @@ def send_alert(new_items):
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = RECEIVER_EMAIL
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    
+    # 텍스트와 HTML 둘 다 첨부하여 어떤 뷰어에서도 완벽하게 표시
+    msg.attach(MIMEText(plain_text, "plain", "utf-8"))
+    msg.attach(MIMEText(html_content, "html", "utf-8"))
 
     with smtplib.SMTP_SSL("smtp.naver.com", 465, timeout=10) as s:
         s.login(NAVER_USER, NAVER_PASSWORD)
