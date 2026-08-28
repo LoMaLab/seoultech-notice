@@ -4,17 +4,21 @@ import smtplib
 import re
 import urllib.parse
 import hashlib
+import urllib3
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
+# SSL 경고 숨김
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 NAVER_USER = os.environ.get("NAVER_USER")
 NAVER_PASSWORD = os.environ.get("NAVER_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
-# 1. 일반 공지사항 게시판 (신규 게시글 감시)
+# 1. 학교 공지사항 게시판
 TARGET_BOARDS = [
     {"name": "서울과기대 대학공지", "url": "https://www.seoultech.ac.kr/service/info/notice/"},
     {"name": "서울과기대 학사공지", "url": "https://www.seoultech.ac.kr/service/info/matters/"},
@@ -23,7 +27,7 @@ TARGET_BOARDS = [
     {"name": "지능형로봇전공 일반자료실", "url": "https://ir.seoultech.ac.kr/info/general_resources"}
 ]
 
-# 2. MOAI 연구실 웹페이지 (내용/멤버/논문/갤러리 변경 감시)
+# 2. MOAI 연구실 웹페이지
 TARGET_PAGES = [
     {"name": "MOAI 연구실 - Home", "url": "https://moai.seoultech.ac.kr/home"},
     {"name": "MOAI 연구실 - People", "url": "https://moai.seoultech.ac.kr/people"},
@@ -37,12 +41,12 @@ HEADERS = {
 }
 
 # ==========================================
-# [기능 1] 일반 공지사항 게시판 크롤링
+# [기능 1] 게시판 크롤링
 # ==========================================
 def fetch_board_notices(board):
     notices = []
     try:
-        res = requests.get(board["url"], headers=HEADERS, timeout=12)
+        res = requests.get(board["url"], headers=HEADERS, timeout=15, verify=False)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, "html.parser")
         
@@ -79,40 +83,60 @@ def fetch_board_notices(board):
     return notices
 
 # ==========================================
-# [기능 2] MOAI 연구실 페이지 내용 변경 감시
+# [기능 2] MOAI 연구실 정밀 텍스트 노이즈 필터링
 # ==========================================
+def clean_page_content(soup):
+    """동적 태그, 세션 토큰, 스크립트, 광고, 헤더/푸터 잡음을 제거하고 순수 본문만 추출"""
+    # 1. 변경 감지를 방해하는 동적 태그 일괄 제거
+    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "meta", "input", "iframe"]):
+        tag.decompose()
+    
+    # 2. 본문 텍스트 추출 및 공백 정규화
+    text_chunks = [re.sub(r'\s+', ' ', t).strip() for t in soup.stripped_strings if len(t.strip()) > 1]
+    cleaned_text = " ".join(text_chunks)
+    
+    # 3. 이미지 파일명(경로)만 추출 (?뒤의 타임스탬프 파라미터는 제거)
+    img_names = []
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        clean_src = urllib.parse.urlparse(src).path
+        if clean_src:
+            img_names.append(clean_src)
+            
+    # 4. 링크 주소만 추출 (?뒤의 세션 토큰 제거)
+    a_paths = []
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        clean_href = urllib.parse.urlparse(href).path
+        if clean_href:
+            a_paths.append(clean_href)
+
+    return cleaned_text + "".join(img_names) + "".join(a_paths)
+
 def fetch_page_changes(page, seen_set, is_first_run):
-    """웹페이지의 본문 텍스트 및 링크 상태를 해시로 비교하여 변경 감지"""
     detected_changes = []
     prefix = f"PAGE_{page['name']}_"
     
     try:
-        res = requests.get(page["url"], headers=HEADERS, timeout=12)
+        res = requests.get(page["url"], headers=HEADERS, timeout=15, verify=False)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, "html.parser")
         
-        # 불필요한 스크립트, 스타일 태그 제거
-        for tag in soup(["script", "style", "noscript", "svg"]):
-            tag.decompose()
-        
-        # 페이지 본문 텍스트 및 이미지/링크 주소 추출 후 고유 해시 생성
-        page_text = " ".join(soup.stripped_strings)
-        img_srcs = "".join([img.get("src", "") for img in soup.find_all("img")])
-        a_hrefs = "".join([a.get("href", "") for a in soup.find_all("a")])
-        combined_content = page_text + img_srcs + a_hrefs
-        
-        current_hash = hashlib.sha256(combined_content.encode("utf-8")).hexdigest()
+        # 정제된 순수 콘텐츠 생성
+        content = clean_page_content(soup)
+        if not content:
+            return []
+            
+        current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         current_key = f"{prefix}{current_hash}"
         
-        # 이전 해시 키 검색
         old_keys = [k for k in seen_set if k.startswith(prefix)]
         
         if not old_keys:
-            # 최초 등록 시
             seen_set.add(current_key)
-            print(f"[{page['name']}] 기준 상태 등록 완료.")
+            print(f"[{page['name']}] 기준 해시 신규 등록 완료.")
         elif current_key not in seen_set:
-            # 해시가 변경됨 = 내용 수정/추가 발생!
+            # 내용이 실제로 바뀌었을 때만 갱신 및 알림
             for old_k in old_keys:
                 seen_set.remove(old_k)
             seen_set.add(current_key)
@@ -121,14 +145,14 @@ def fetch_page_changes(page, seen_set, is_first_run):
                 detected_changes.append({
                     "id": current_key,
                     "board": page["name"],
-                    "title": f"[{page['name'].replace('MOAI 연구실 - ', '')}] 페이지에 새로운 업데이트/내용 변경이 감지되었습니다.",
+                    "title": f"[{page['name'].replace('MOAI 연구실 - ', '')}] 페이지에 실제 내용 업데이트가 감지되었습니다.",
                     "link": page["url"],
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "type": "page"
                 })
-                print(f"[{page['name']}] 내용 변경 감지!")
+                print(f"[{page['name']}] 실제 내용 변경 감지!")
     except Exception as e:
-        print(f"[{page['name']}] 페이지 확인 중 오류: {e}")
+        print(f"[{page['name']}] 확인 중 에러: {e}")
         
     return detected_changes
 
@@ -145,15 +169,13 @@ def send_alert(new_items):
     else:
         subject = f"[과기대/연구실] 신규 공지 및 업데이트 {count}건이 감지되었습니다."
 
-    # 1. 텍스트 본문 (일반 텍스트 뷰어용)
     plain_text = "🔔 서울과기대 & MOAI 연구실 실시간 업데이트 알림\n\n"
     for item in new_items:
         tag = "📌 [공지사항]" if item.get("type") == "board" else "🔬 [연구실 업데이트]"
         plain_text += f"{tag} [{item['board']}] {item['date']}\n"
-        plain_text += f"제목/내용: {item['title']}\n"
+        plain_text += f"제목: {item['title']}\n"
         plain_text += f"바로가기: {item['link']}\n\n"
 
-    # 2. HTML 본문 (모바일 최적화 및 터치 링크)
     html_items = ""
     for item in new_items:
         is_page = (item.get("type") == "page")
@@ -215,7 +237,7 @@ def send_alert(new_items):
     print(f"알림 메일 발송 완료 ({count}건)")
 
 # ==========================================
-# [기능 4] 메인 통합 검사 루틴
+# [기능 4] 메인 루틴
 # ==========================================
 def main():
     seen_set = set()
@@ -228,7 +250,6 @@ def main():
 
     new_alerts = []
 
-    # 1. 5개 일반 공지사항 검사
     for b in TARGET_BOARDS:
         current_notices = fetch_board_notices(b)
         for item in current_notices:
@@ -237,18 +258,15 @@ def main():
                 if not first_run:
                     new_alerts.append(item)
 
-    # 2. MOAI 연구실 4개 페이지 변경 검사
     for p in TARGET_PAGES:
         page_changes = fetch_page_changes(p, seen_set, first_run)
         new_alerts.extend(page_changes)
 
-    # 3. 신규 글/변경사항 발견 시 메일 발송
     if new_alerts:
         send_alert(new_alerts)
     else:
-        print("신규 공지사항 및 페이지 변경 없음.")
+        print("신규 공지사항 및 실제 페이지 변경 없음 (정상 확인).")
 
-    # 4. 상태 저장
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen_set), f, ensure_ascii=False, indent=2)
 
